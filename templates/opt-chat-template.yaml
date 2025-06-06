@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opt-chat-template
+data:
+  template.jinja: |-
+    {%- if messages[0]['role'] == 'system' -%}
+        {%- set system_message = messages[0]['content'] + '\n\n' -%}
+        {%- set messages = messages[1:] -%}
+    {%- else -%}
+        {%- set system_message = '' -%}
+    {%- endif -%}
+
+    {{- system_message -}}
+    {%- for message in messages -%}
+        {%- if message['role'] == 'user' -%}
+    User: {{ message['content'] }}
+
+        {%- elif message['role'] == 'assistant' -%}
+    Assistant: {{ message['content'] }}
+
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if add_generation_prompt -%}
+    User: {% endif %} 

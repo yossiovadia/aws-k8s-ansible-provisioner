@@ -1,0 +1,714 @@
+---
+- name: Setup Kubernetes Cluster on with CRI-O
+  hosts: all
+  become: yes
+  gather_facts: true
+  vars:
+    kubernetes_version: "1.33"
+    crio_version: "1.33"
+    pod_network_cidr: "192.168.0.0/16" # Default CIDR
+    # Prometheus variables
+    prometheus_namespace: "monitoring"
+    install_prometheus: true
+    # vLLM variables
+    vllm_image: "vllm/vllm-openai:latest"
+    vllm_model_name: "microsoft/Phi-3-mini-4k-instruct"
+    vllm_deployment_name: "vllm-phi3-mini"
+    vllm_pvc_name: "model-storage-1"
+  tasks:
+    - name: Update system packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+
+    - name: Add hostname to /etc/hosts on all nodes
+      shell: |
+        echo "127.0.0.1 {{ ansible_hostname }}" >> /etc/hosts
+
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: Configure kernel modules for CRI-O
+      copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/crio.conf
+
+    - name: Load kernel modules
+      modprobe:
+        name: "{{ item }}"
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Stop containerd service on all nodes
+      systemd:
+        name: containerd
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: Configure sysctl parameters for Kubernetes CRI
+      copy:
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+
+    - name: Apply sysctl parameters
+      command: sysctl --system
+
+    - name: Install required packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+        state: present
+
+    - name: Check if CRI-O is already installed
+      command: dpkg -l cri-o
+      register: crio_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Display CRI-O installation status
+      debug:
+        msg: "CRI-O status: {{ 'installed' if crio_check.rc == 0 else 'not installed' }}"
+
+    - name: Create apt keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes GPG key
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes repository
+      shell: |
+        echo "deb [trusted=yes] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /" | tee /etc/apt/sources.list.d/kubernetes.list
+      args:
+        creates: /etc/apt/sources.list.d/kubernetes.list
+
+    - name: Add CRI-O GPG key (OpenSUSE repository)
+      shell: |
+        curl -fsSL https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v{{ crio_version }}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/cri-o-apt-keyring.gpg
+      when: crio_check.rc != 0
+      ignore_errors: yes
+
+    - name: Add CRI-O repository (OpenSUSE) with trusted flag
+      shell: |
+        echo "deb [trusted=yes] https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v{{ crio_version }}/deb/ /" | tee /etc/apt/sources.list.d/cri-o.list
+      args:
+        creates: /etc/apt/sources.list.d/cri-o.list
+      when: crio_check.rc != 0
+
+    - name: Update apt cache after adding repositories
+      apt:
+        update_cache: yes
+      when: crio_check.rc != 0
+
+    - name: Install CRI-O and Kubernetes components
+      apt:
+        name:
+          - cri-o
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+      when: crio_check.rc != 0
+
+
+    - name: Install only Kubernetes components if CRI-O exists
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: yes
+      when: crio_check.rc == 0
+
+    - name: Hold Kubernetes packages
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Configure CRI-O
+      copy:
+        content: |
+          [crio.runtime]
+          default_runtime = "runc"
+          no_pivot = false
+          decryption_keys_path = "/etc/crio/keys/"
+          conmon = ""
+          conmon_cgroup = "pod"
+          conmon_env = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          ]
+          selinux = false
+          seccomp_profile = ""
+          apparmor_profile = "crio-default"
+          cgroup_manager = "systemd"
+          
+          [crio.image]
+          default_transport = "docker://"
+          pause_image = "registry.k8s.io/pause:3.9"
+          pause_image_auth_file = ""
+          pause_command = "/pause"
+          
+          [crio.network]
+          network_dir = "/etc/cni/net.d/"
+          plugin_dirs = [
+            "/opt/cni/bin/",
+          ]
+        dest: /etc/crio/crio.conf
+        backup: yes
+      when: crio_check.rc != 0
+
+    - name: Start and enable CRI-O
+      systemd:
+        name: crio
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Check CRI-O service status
+      command: systemctl status crio
+      register: crio_status
+      changed_when: false
+
+    - name: Display CRI-O service status
+      debug:
+        msg: "CRI-O is running: {{ 'active' in crio_status.stdout }}"
+
+    - name: Install crictl (container runtime interface CLI)
+      shell: |
+        CRICTL_VERSION="v{{ kubernetes_version }}.0"
+        curl -L "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" | tar -C /usr/local/bin -xz
+        chmod +x /usr/local/bin/crictl
+      args:
+        creates: /usr/local/bin/crictl
+
+    - name: Configure crictl to use CRI-O
+      copy:
+        content: |
+          runtime-endpoint: unix:///var/run/crio/crio.sock
+          image-endpoint: unix:///var/run/crio/crio.sock
+          timeout: 2
+          debug: false
+          pull-image-on-create: false
+        dest: /etc/crictl.yaml
+        mode: '0644'
+
+- name: Initialize Kubernetes Master (Single Node Cluster)
+  hosts: all
+  become: yes
+  vars:
+    pod_network_cidr: "192.168.0.0/16" # Default CIDR
+    kubernetes_version: "1.33"
+  tasks:
+    - name: Verify CRI-O is working before kubeadm init
+      shell: |
+        systemctl is-active crio
+        crictl version
+        crictl info
+      register: crio_pre_check
+      changed_when: false
+
+    - name: Display CRI-O pre-check status
+      debug:
+        msg: "CRI-O pre-check: {{ crio_pre_check.stdout_lines }}"
+
+    - name: Check if Kubernetes cluster is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeconfig_exists
+
+    - name: Initialize Kubernetes cluster with CRI-O
+      command: kubeadm init --pod-network-cidr={{ pod_network_cidr }} --cri-socket=unix:///var/run/crio/crio.sock
+      register: kubeadm_init
+      when: not kubeconfig_exists.stat.exists
+      
+    - name: Create .kube directory for user
+      file:
+        path: "{{ ansible_env.HOME }}/.kube"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Create .kube directory for current user's home directory
+      file:
+        path: "{{ ansible_env.HOME | default(lookup('env', 'HOME')) }}/.kube"
+        state: directory
+        owner: "{{ ansible_env.USER | default(lookup('env', 'USER')) }}"
+        group: "{{ ansible_env.USER | default(lookup('env', 'USER')) }}"
+        mode: '0755'
+      when: ansible_env.USER != ansible_user or ansible_user is undefined
+
+    - name: Copy admin.conf to user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_env.HOME }}/.kube/config"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+        remote_src: yes
+
+    - name: Copy admin.conf to current user's kube config
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_env.HOME | default(lookup('env', 'HOME')) }}/.kube/config"
+        owner: "{{ ansible_env.USER | default(lookup('env', 'USER')) }}"
+        group: "{{ ansible_env.USER | default(lookup('env', 'USER')) }}"
+        mode: '0644'
+        remote_src: yes
+      when: ansible_env.USER != ansible_user or ansible_user is undefined
+
+    - name: Wait for Kubernetes nodes to be ready
+      shell: kubectl get nodes --request-timeout=10s
+      register: kubectl_nodes
+      until: kubectl_nodes.rc == 0
+      retries: 30
+      delay: 10
+      become: no
+
+    - name: Install Flannel CNI with custom network configuration
+      shell: |
+        # Download the Flannel YAML
+        curl -s https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml > /tmp/kube-flannel.yml
+        # Modify the network configuration to match our pod network CIDR
+        # This handles both the net-conf.json ConfigMap and any other references
+        sed -i 's|"Network": "10.244.0.0/16"|"Network": "{{ pod_network_cidr }}"|g' /tmp/kube-flannel.yml
+        sed -i 's|10.244.0.0/16|{{ pod_network_cidr }}|g' /tmp/kube-flannel.yml
+        # Apply the modified Flannel configuration
+        kubectl apply -f /tmp/kube-flannel.yml
+        # Clean up the temporary file
+        # rm -f /tmp/kube-flannel.yml
+      become: no
+
+
+    - name: Wait for Flannel pods to be ready
+      shell: kubectl wait --for=condition=ready pod -l app=flannel -n kube-flannel --timeout=300s
+      become: no
+      become_user: "{{ ansible_user }}"
+      ignore_errors: yes
+
+    - name: Remove master node taint to make it schedulable (Single Node Setup)
+      shell: |
+        kubectl taint nodes --all node-role.kubernetes.io/control-plane- || true
+        kubectl taint nodes --all node-role.kubernetes.io/master- || true
+      become: no
+      ignore_errors: yes
+
+- name: Install NVIDIA GPU Operator
+  hosts: all
+  become: yes
+  tasks:
+    - name: Install Helm
+      shell: |
+        curl https://baltocdn.com/helm/signing.asc | gpg --dearmor > /usr/share/keyrings/helm.gpg
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" > /etc/apt/sources.list.d/helm-stable-debian.list
+        apt update
+        apt install helm -y
+
+    - name: Add NVIDIA Helm repo
+      shell: |
+        helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+        helm repo update
+      become: no
+
+    - name: Install NVIDIA GPU Operator with CRI-O
+      shell: |
+        helm install --wait --generate-name \
+          -n gpu-operator --create-namespace \
+          nvidia/gpu-operator \
+          --set driver.enabled=true \
+          --set operator.defaultRuntime=crio
+      become: no
+
+- name: Setup Local HostPath Storage
+  hosts: all
+  become: yes
+  tasks:
+    - name: Create local storage directories on all nodes
+      file:
+        path: /opt/local-path-provisioner
+        state: directory
+        mode: '0755'
+
+- name: Configure Storage Class
+  hosts: all
+  become: no
+  tasks:
+    - name: Install local-path-provisioner
+      shell: |
+        kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/refs/heads/master/deploy/local-path-storage.yaml
+
+    - name: Wait for local-path-provisioner to be ready
+      shell: kubectl wait --for=condition=ready pod -l app=local-path-provisioner -n local-path-storage --timeout=300s
+
+    - name: Set local-path as default storage class
+      shell: |
+        kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+    - name: Create PVCs for model storage
+      shell: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: model-storage-1
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: local-path
+          resources:
+            requests:
+              storage: 100Gi
+        ---
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: model-storage-2
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          storageClassName: local-path
+          resources:
+            requests:
+              storage: 100Gi
+        EOF
+
+
+- name: Install Prometheus Stack
+  hosts: all
+  become: no
+  vars:
+    prometheus_namespace: "monitoring"
+  tasks:
+    - name: Create monitoring namespace
+      shell: kubectl create namespace {{ prometheus_namespace }}
+      ignore_errors: true
+
+    - name: Add Prometheus helm repo
+      shell: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+
+    - name: Update helm repos
+      shell: helm repo update
+
+    - name: Install Prometheus Stack
+      shell: |
+        helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+          --namespace {{ prometheus_namespace }} \
+          --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+          --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
+          --set grafana.enabled=true \
+          --set grafana.adminPassword=admin \
+          --set prometheus.prometheusSpec.retention=15d \
+          --set prometheus.prometheusSpec.resources.requests.memory=1Gi \
+          --set prometheus.prometheusSpec.resources.requests.cpu=500m \
+          --set prometheus.prometheusSpec.resources.limits.memory=2Gi \
+          --set prometheus.prometheusSpec.resources.limits.cpu=1000m
+
+    - name: Wait for Prometheus CRDs to be ready
+      shell: |
+        kubectl wait --for condition=established --timeout=60s crd/prometheuses.monitoring.coreos.com
+        kubectl wait --for condition=established --timeout=60s crd/servicemonitors.monitoring.coreos.com
+        kubectl wait --for condition=established --timeout=60s crd/podmonitors.monitoring.coreos.com
+        kubectl wait --for condition=established --timeout=60s crd/alertmanagers.monitoring.coreos.com
+
+    - name: Wait for Prometheus pods to be ready
+      shell: |
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=prometheus -n {{ prometheus_namespace }} --timeout=300s
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=grafana -n {{ prometheus_namespace }} --timeout=300s
+
+- name: Create Chat Template ConfigMaps
+  hosts: all
+  become: no
+  vars:
+    vllm_model_name: "microsoft/Phi-3-mini-4k-instruct"
+  tasks:
+    - name: Copy Phi Chat Template to remote node
+      copy:
+        src: templates/phi-chat-template.yaml
+        dest: /tmp/phi-chat-template.yaml
+        mode: '0644'
+
+    - name: Create Phi Chat Template ConfigMap
+      shell: kubectl apply -f /tmp/phi-chat-template.yaml
+
+
+- name: Deploy Single vLLM Instance
+  hosts: all
+  become: no
+  vars:
+    vllm_image: "vllm/vllm-openai:latest"
+    vllm_model_name: "microsoft/Phi-3-mini-4k-instruct"
+    vllm_deployment_name: "vllm-phi3-mini"
+    vllm_pvc_name: "model-storage-1"
+    prometheus_namespace: "monitoring"
+    install_prometheus: true
+  tasks:
+    - name: Delete existing vLLM deployments and services
+      shell: |
+        kubectl delete deployment,service -l app.kubernetes.io/part-of=vllm || true
+
+    - name: Deploy vLLM Model
+      shell: |
+        kubectl apply -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: {{ vllm_deployment_name }}
+          labels:
+            app.kubernetes.io/part-of: vllm
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: {{ vllm_deployment_name }}
+          template:
+            metadata:
+              labels:
+                app: {{ vllm_deployment_name }}
+            spec:
+              containers:
+                - name: vllm-container
+                  image: {{ vllm_image }}
+                  command: ["/bin/sh", "-c"]
+                  args:
+                    - |
+                      python3 -m vllm.entrypoints.openai.api_server \
+                        --model {{ vllm_model_name }} \
+                        --tensor-parallel-size 1 \
+                        --dtype=half \
+                        --gpu-memory-utilization .95 \
+                        --max-model-len=1024 \
+                        --chat-template /templates/template.jinja
+                  ports:
+                    - containerPort: 8000
+                      name: http
+                  volumeMounts:
+                    - name: model-cache
+                      mountPath: /root/.cache/huggingface
+                    - name: chat-template
+                      mountPath: /templates
+                  resources:
+                    limits:
+                      nvidia.com/gpu: 1
+                  startupProbe:
+                    httpGet:
+                      path: /v1/models
+                      port: 8000
+                    failureThreshold: 360
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /v1/models
+                      port: 8000
+                    initialDelaySeconds: 60
+                    periodSeconds: 30
+                  livenessProbe:
+                    httpGet:
+                      path: /v1/models
+                      port: 8000
+                    initialDelaySeconds: 60
+                    periodSeconds: 30
+              volumes:
+                - name: model-cache
+                  persistentVolumeClaim:
+                    claimName: {{ vllm_pvc_name }}
+                - name: chat-template
+                  configMap:
+                    name: phi-chat-template
+        EOF
+
+    - name: Create vLLM Service
+      shell: |
+        kubectl apply -f - <<EOF
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: {{ vllm_deployment_name }}-service
+          labels:
+            app: {{ vllm_deployment_name }}
+            app.kubernetes.io/part-of: vllm
+            model_name: {{ vllm_model_name | replace('/', '-') }}
+        spec:
+          type: ClusterIP
+          selector:
+            app: {{ vllm_deployment_name }}
+          ports:
+            - protocol: TCP
+              port: 8000
+              targetPort: http
+              name: http
+        EOF
+
+    - name: Create ServiceMonitor for vLLM
+      shell: |
+        kubectl apply -f - <<EOF
+        apiVersion: monitoring.coreos.com/v1
+        kind: ServiceMonitor
+        metadata:
+          name: {{ vllm_deployment_name }}-monitor
+          namespace: {{ prometheus_namespace }}
+        spec:
+          endpoints:
+          - interval: 15s
+            port: http
+            relabelings:
+            - action: replace
+              regex: (.*)
+              replacement: $1
+              sourceLabels:
+              - __meta_kubernetes_pod_node_name
+              targetLabel: instance
+            scheme: http
+          jobLabel: app.kubernetes.io/name
+          selector:
+            matchLabels:
+              app: {{ vllm_deployment_name }}
+          namespaceSelector:
+            matchNames:
+            - default
+        EOF
+      when: install_prometheus|bool
+
+    - name: Create GPU Operator RBAC and ServiceMonitor
+      shell: |
+        kubectl apply -f - <<EOF
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata:
+          name: prometheus-k8s-gpu-operator
+          namespace: {{ prometheus_namespace }}
+          labels:
+            app.kubernetes.io/component: prometheus
+            app.kubernetes.io/name: prometheus
+        rules:
+        - apiGroups: [""]
+          resources: ["services", "endpoints", "pods"]
+          verbs: ["get", "list", "watch"]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata:
+          name: prometheus-k8s-gpu-operator
+          namespace: {{ prometheus_namespace }}
+          labels:
+            app.kubernetes.io/component: prometheus
+            app.kubernetes.io/name: prometheus
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: Role
+          name: prometheus-k8s-gpu-operator
+        subjects:
+        - kind: ServiceAccount
+          name: prometheus-k8s
+          namespace: {{ prometheus_namespace }}
+        ---
+        apiVersion: monitoring.coreos.com/v1
+        kind: ServiceMonitor
+        metadata:
+          name: gpu-operator
+          namespace: {{ prometheus_namespace }}
+        spec:
+          endpoints:
+          - interval: 5s
+            port: gpu-metrics
+            relabelings:
+            - action: replace
+              regex: (.*)
+              replacement: $1
+              sourceLabels:
+              - __meta_kubernetes_pod_node_name
+              targetLabel: instance
+            scheme: http
+          jobLabel: app.kubernetes.io/name
+          namespaceSelector:
+            matchNames:
+            - gpu-operator
+          selector:
+            matchLabels:
+              app: nvidia-dcgm-exporter
+        EOF
+      when: install_prometheus|bool
+
+    - name: Wait for vLLM deployment to be ready
+      shell: |
+        kubectl wait --for=condition=available deployment/{{ vllm_deployment_name }} --timeout=600s
+
+    - name: Test vLLM models endpoint
+      shell: |
+        kubectl exec -ti deployment/{{ vllm_deployment_name }} -- curl -s localhost:8000/v1/models
+      register: models_response
+      retries: 3
+      delay: 10
+
+    - name: Display available models
+      debug:
+        msg: "Available models: {{ models_response.stdout | from_json }}"
+
+    - name: Test vLLM chat completions endpoint
+      shell: |
+        kubectl exec -ti deployment/{{ vllm_deployment_name }} -- curl -s localhost:8000/v1/chat/completions \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "{{ vllm_model_name }}",
+            "messages": [
+              {"role": "user", "content": "Hello! Can you tell me what you are?"}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 100
+          }'
+      register: chat_response
+      retries: 3
+      delay: 10
+
+    - name: Display chat completion response
+      debug:
+        msg: "Chat response: {{ chat_response.stdout | from_json }}"
+
+    - name: Test vLLM health check
+      shell: |
+        kubectl exec -ti deployment/{{ vllm_deployment_name }} -- curl -s localhost:8000/health
+      register: health_response
+      retries: 3
+      delay: 5
+
+    - name: Display health status
+      debug:
+        msg: "Health status: {{ health_response.stdout }}"
+
+    - name: Get vLLM service information
+      shell: |
+        kubectl get service {{ vllm_deployment_name }}-service -o jsonpath='{.spec.clusterIP}:{.spec.ports[0].port}'
+      register: service_info
+
+
+    - name: Final deployment summary
+      debug:
+        msg: |          
+          Model: {{ vllm_model_name }}
+          Service: {{ vllm_deployment_name }}-service
+          Cluster IP: {{ service_info.stdout }}

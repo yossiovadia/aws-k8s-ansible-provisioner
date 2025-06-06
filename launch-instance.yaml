@@ -1,0 +1,162 @@
+---
+- name: Launch AWS GPU instance in US East 2
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    aws_region: us-east-2
+    instance_type: g6.4xlarge      # 1 L4 GPU
+    ami_id: ami-00f71ac70c2d6344d  # Ubuntu 22.04 with NVIDIA GPU driver
+    key_pair: router-team-us-east2
+    security_group_id: sg-0704e6bcaa5e655b1  # k8s security group
+    root_volume_size: 500  # GB
+    instance_name: "GPU-Instance-{{ ansible_date_time.epoch }}"
+    
+  tasks:
+    - name: Ensure boto3 and botocore are installed
+      pip:
+        name:
+          - boto3
+          - botocore
+        state: present
+      delegate_to: localhost
+
+    - name: Launch EC2 instance
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        availability_zone: "{{ aws_region }}b"
+        name: "{{ instance_name }}"
+        image_id: "{{ ami_id }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_pair }}"
+        security_groups:
+          - "{{ security_group_id }}"
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_type: gp3
+              volume_size: "{{ root_volume_size }}"
+              delete_on_termination: true
+              encrypted: true
+        state: running
+        wait: true
+        wait_timeout: 600
+        tags:
+          Name: "{{ instance_name }}"
+          Environment: production
+          InstanceType: "{{ instance_type }}"
+          AMI: "{{ ami_id }}"
+          CreatedBy: ansible
+          CreatedAt: "{{ ansible_date_time.iso8601 }}"
+      register: ec2_instance
+
+    - name: Display instance information
+      debug:
+        msg:
+          - "Instance launched successfully!"
+          - "Instance ID: {{ ec2_instance.instances[0].instance_id }}"
+          - "Instance Type: {{ ec2_instance.instances[0].instance_type }}"
+          - "Public IP: {{ ec2_instance.instances[0].public_ip_address | default('N/A') }}"
+          - "Private IP: {{ ec2_instance.instances[0].private_ip_address }}"
+          - "State: {{ ec2_instance.instances[0].state.name }}"
+          - "Launch Time: {{ ec2_instance.instances[0].launch_time }}"
+
+    - name: Wait for SSH to become available
+      wait_for:
+        host: "{{ ec2_instance.instances[0].public_ip_address }}"
+        port: 22
+        delay: 60
+        timeout: 300
+        state: started
+      when: ec2_instance.instances[0].public_ip_address is defined
+
+    - name: Add instance to inventory
+      add_host:
+        hostname: "{{ ec2_instance.instances[0].public_ip_address | default(ec2_instance.instances[0].private_ip_address) }}"
+        groupname: gpu_instances
+        ansible_user: ubuntu
+        ansible_ssh_private_key_file: "~/.ssh/{{ key_pair }}.pem"
+        ansible_ssh_common_args: '-o StrictHostKeyChecking=no'
+        instance_id: "{{ ec2_instance.instances[0].instance_id }}"
+      when: ec2_instance.instances[0] is defined
+
+    - name: Save instance details to file
+      copy:
+        content: |
+          Instance Details:
+          =================
+          Instance ID: {{ ec2_instance.instances[0].instance_id }}
+          Instance Name: {{ instance_name }}
+          Instance Type: {{ ec2_instance.instances[0].instance_type }}
+          AMI ID: {{ ec2_instance.instances[0].image_id }}
+          Region: {{ aws_region }}
+          Public IP: {{ ec2_instance.instances[0].public_ip_address | default('N/A') }}
+          Private IP: {{ ec2_instance.instances[0].private_ip_address }}
+          Key Pair: {{ key_pair }}
+          Security Group: {{ security_group_id }}
+          Root Volume Size: {{ root_volume_size }}GB
+          Launch Time: {{ ec2_instance.instances[0].launch_time }}
+          
+          SSH Command:
+          ssh -i ~/.ssh/{{ key_pair }}.pem ubuntu@{{ ec2_instance.instances[0].public_ip_address | default(ec2_instance.instances[0].private_ip_address) }}
+        dest: "./instance-{{ ec2_instance.instances[0].instance_id }}-details.txt"
+      delegate_to: localhost
+
+    - name: Generate inventory file for GPU instance
+      copy:
+        content: |
+          [gpu_instances]
+          {{ instance_name.lower().replace(' ', '-') }} ansible_host={{ ec2_instance.instances[0].public_ip_address | default(ec2_instance.instances[0].private_ip_address) }} ansible_user=ubuntu
+
+          [all:vars]
+          ansible_ssh_private_key_file=~/.ssh/{{ key_pair }}.pem
+          ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+          ansible_become=yes
+          ansible_become_method=sudo
+        dest: "./gpu-inventory-{{ ec2_instance.instances[0].instance_id }}.ini"
+      delegate_to: localhost
+
+
+- name: Post-launch configuration
+  hosts: gpu_instances
+  become: yes
+  gather_facts: yes
+  tasks:
+    - name: Update system packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+        autoremove: yes
+      when: ansible_os_family == "Debian"
+
+    - name: Install packages for debugging
+      apt:
+        name:
+          - htop
+          - vim
+          - curl
+          - wget
+          - git
+          - python3-pip
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Check NVIDIA driver installation
+      command: nvidia-smi
+      register: nvidia_smi_output
+      ignore_errors: yes
+
+    - name: Display NVIDIA driver status
+      debug:
+        msg: |
+          NVIDIA Driver Status:
+          {{ nvidia_smi_output.stdout if nvidia_smi_output.rc == 0 else 'NVIDIA driver not found or not working properly' }}
+
+    - name: Check GPU availability
+      shell: lspci | grep -i nvidia
+      register: gpu_check
+      ignore_errors: yes
+
+    - name: Display GPU information
+      debug:
+        msg: "GPU Information: {{ gpu_check.stdout if gpu_check.rc == 0 else 'No NVIDIA GPU detected' }}" 
