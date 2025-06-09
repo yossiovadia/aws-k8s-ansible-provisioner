@@ -34,6 +34,12 @@ deploy_cluster() {
 
     echo "Deployment complete!"
     echo "Check the instance details file for SSH access information." 
+
+    echo "Deploying LLM-D..."
+    ansible-playbook -i "$INVENTORY_FILE" llm-d-deploy.yaml
+
+    echo "Testing LLM-D..."
+    ansible-playbook -i "$INVENTORY_FILE" llm-d-test.yaml
 }
 
 cleanup_instances() {

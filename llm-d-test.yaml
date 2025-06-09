@@ -1,0 +1,82 @@
+- name: Test LLM-D Deployment
+  hosts: all
+  become: no
+  gather_facts: false
+  vars:
+    llm_d_namespace: "llm-d"
+    model: "Qwen/Qwen3-0.6B"
+    
+  tasks:
+    - name: Create test id variable
+      set_fact:
+        test_id: "{{ 999999 | random }}"
+
+    - name: Get gateway information
+      shell: |
+        kubectl get gateway -n {{ llm_d_namespace }} -o jsonpath='{.items[0].status.addresses[0].value}' 2>/dev/null || \
+        kubectl get service -n {{ llm_d_namespace }} -l app.kubernetes.io/name=llm-d-inference-gateway -o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null || \
+        echo "llm-d-inference-gateway.{{ llm_d_namespace }}.svc.cluster.local"
+      register: gateway_addr
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+
+    - name: Set gateway address
+      set_fact:
+        gateway_address: "{{ gateway_addr.stdout if gateway_addr.stdout != '' else 'llm-d-inference-gateway.' + llm_d_namespace + '.svc.cluster.local' }}"
+
+    - name: Display gateway address
+      debug:
+        msg: "Using gateway address: {{ gateway_address }}"
+
+    - name: GET /v1/models via gateway
+      shell: |
+        kubectl delete pod curl-gw-models-{{ test_id }} -n {{ llm_d_namespace }} || true && \
+        kubectl run curl-gw-models-{{ test_id }} \
+          --namespace {{ llm_d_namespace }} \
+          --image=curlimages/curl --restart=Never -- \
+          curl -sS http://{{ gateway_address }}/v1/models \
+          -H 'accept: application/json' \
+          -H 'Content-Type: application/json' && \
+        kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/curl-gw-models-{{ test_id }} -n {{ llm_d_namespace }} --timeout=60s && \
+        kubectl logs curl-gw-models-{{ test_id }} -n {{ llm_d_namespace }} && \
+        kubectl delete pod curl-gw-models-{{ test_id }} -n {{ llm_d_namespace }}
+      register: gateway_models_response
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 3
+      delay: 5
+
+    - name: Display available models from gateway
+      debug:
+        msg: "Available models from gateway: {{ gateway_models_response.stdout }}"
+
+    - name: Verify model availability via gateway
+      assert:
+        that:
+          - model in gateway_models_response.stdout
+        fail_msg: "Model {{ model }} not available via gateway"
+        success_msg: "Model {{ model }} confirmed available via gateway"
+
+    - name: POST /v1/completions via gateway
+      shell: |
+        kubectl delete pod curl-gw-completion-{{ test_id }} -n {{ llm_d_namespace }} || true && \
+        kubectl run curl-gw-completion-{{ test_id }}  \
+          --namespace {{ llm_d_namespace }} \
+          --image=curlimages/curl --restart=Never -- \
+          curl -sS -X POST http://{{ gateway_address }}/v1/completions \
+          -H 'accept: application/json' \
+          -H 'Content-Type: application/json' \
+          -d '{"model":"{{ model }}","prompt":"Who are you?"}' && \
+        kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/curl-gw-completion-{{ test_id }} -n {{ llm_d_namespace }} --timeout=60s && \
+        kubectl logs curl-gw-completion-{{ test_id }} -n {{ llm_d_namespace }} && \
+        kubectl delete pod curl-gw-completion-{{ test_id }} -n {{ llm_d_namespace }}
+      register: gateway_completion_response
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 3
+      delay: 5
+
+    - name: Display completion response from gateway
+      debug:
+        msg: "Completion response from gateway: {{ gateway_completion_response.stdout }}"

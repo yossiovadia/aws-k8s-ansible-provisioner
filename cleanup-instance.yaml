@@ -21,10 +21,32 @@
         patterns: "gpu-inventory-*.ini"
       register: inventory_files
 
-    - name: Extract instance IDs from inventory filenames
-      set_fact:
-        instance_ids: "{{ inventory_files.files | map(attribute='path') | map('basename') | map('regex_replace', '^gpu-inventory-(.+)\\.ini$', '\\1') | list }}"
+    - name: Extract instance IDs from inventory files
+      shell: |
+        instance_ids=()
+        for file in gpu-inventory-*.ini; do
+          if [ -f "$file" ]; then
+            # First try to extract instance IDs from the file content
+            content_ids=$(grep -o 'instance_id=[i-][a-z0-9]\+' "$file" | cut -d'=' -f2 2>/dev/null || true)
+            if [ -n "$content_ids" ]; then
+              echo "$content_ids"
+            else
+              # If no instance_id found in content, check if filename contains instance ID
+              filename=$(basename "$file" .ini)
+              filename_id=$(echo "$filename" | grep -o 'i-[a-z0-9]\+' || true)
+              if [ -n "$filename_id" ]; then
+                echo "$filename_id"
+              fi
+            fi
+          fi
+        done | sort | uniq
+      register: extracted_instance_ids
       when: inventory_files.files | length > 0
+
+    - name: Set instance IDs variable
+      set_fact:
+        instance_ids: "{{ extracted_instance_ids.stdout_lines }}"
+      when: inventory_files.files | length > 0 and extracted_instance_ids.stdout_lines | length > 0
 
     - name: Display found instance IDs
       debug:
@@ -79,7 +101,7 @@
       debug:
         msg: |
           Instance {{ item.item.instance_id }} ({{ item.item.tags.Name | default('N/A') }}) 
-          termination status: {{ item.instances[0].state.name }}
+          termination status: {{ item.changed | ternary('terminated', 'unchanged') }}
       loop: "{{ termination_results.results }}"
       when: termination_results is defined and termination_results.results is defined
 

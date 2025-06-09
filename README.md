@@ -31,8 +31,10 @@ Make sure the ssh key is added to the AWS account. We use the key `router-team-u
 - **CNI**: Flannel
 - **Storage**: Local Path Provisioner
 
-### vLLM Settings
-- **Model**: microsoft/Phi-3-mini-4k-instruct
+### LLM-D Settings
+- **Model**: Qwen/Qwen3-0.6B
+- **Storage**: Local Path Provisioner
+- **HuggingFace Token**: Add to ~/.cache/huggingface/token
 
 ### SSH Connection
 ```bash

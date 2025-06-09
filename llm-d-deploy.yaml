@@ -1,0 +1,235 @@
+# Run with: ansible-playbook -i inventory.ini llm-d-deploy.yaml
+---
+- name: Install LLM-D Dependencies for Kubernetes Master Node
+  hosts: all
+  become: yes
+  gather_facts: true
+  vars:
+    kubernetes_version: "1.33"
+    
+  tasks:
+    - name: Determine system architecture
+      set_fact:
+        system_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' if ansible_architecture == 'x86_64' else ansible_architecture }}"
+
+    - name: Install base utility packages if not present
+      apt:
+        name:
+          - jq
+          - make
+          - tar
+          - wget
+        state: present
+        update_cache: yes
+
+    - name: Check if yq is already installed
+      command: which yq
+      register: yq_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install yq (YAML processor) v4+
+      shell: |
+        curl -fsSL https://github.com/mikefarah/yq/releases/latest/download/yq_linux_{{ system_arch }} -o /usr/local/bin/yq
+        chmod +x /usr/local/bin/yq
+      when: yq_check.rc != 0
+      args:
+        creates: /usr/local/bin/yq
+
+    - name: Check if kustomize is already installed
+      command: which kustomize
+      register: kustomize_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Install kustomize (Kubernetes configuration management)
+      shell: |
+        KUSTOMIZE_TAG=$(curl -s https://api.github.com/repos/kubernetes-sigs/kustomize/releases/latest | jq -r '.tag_name')
+        VERSION_NUM=${KUSTOMIZE_TAG#kustomize/}
+        ARCHIVE="kustomize_${VERSION_NUM}_linux_{{ system_arch }}.tar.gz"
+        curl -sLo /tmp/kustomize.tar.gz \
+          "https://github.com/kubernetes-sigs/kustomize/releases/download/${KUSTOMIZE_TAG}/${ARCHIVE}"
+        tar -xzf /tmp/kustomize.tar.gz -C /tmp/
+        mv /tmp/kustomize /usr/local/bin/
+        chmod +x /usr/local/bin/kustomize
+        rm -f /tmp/kustomize.tar.gz
+      when: kustomize_check.rc != 0
+      args:
+        creates: /usr/local/bin/kustomize
+
+    - name: Verify kubectl is installed and working
+      command: kubectl version --client
+      register: kubectl_version
+      changed_when: false
+      become: no
+
+    - name: Display kubectl version
+      debug:
+        msg: "kubectl version: {{ kubectl_version.stdout }}"
+
+    - name: Verify helm is installed and working
+      command: helm version --short
+      register: helm_version
+      changed_when: false
+      become: no
+
+    - name: Display helm version
+      debug:
+        msg: "Helm version: {{ helm_version.stdout }}"
+
+    - name: Verify yq installation
+      command: yq --version
+      register: yq_version
+      changed_when: false
+
+    - name: Display yq version
+      debug:
+        msg: "yq version: {{ yq_version.stdout }}"
+
+    - name: Verify kustomize installation
+      command: kustomize version
+      register: kustomize_version
+      changed_when: false
+
+    - name: Display kustomize version
+      debug:
+        msg: "kustomize version: {{ kustomize_version.stdout }}"
+
+    - name: Create symbolic links for easier access
+      file:
+        src: "/usr/local/bin/{{ item }}"
+        dest: "/usr/bin/{{ item }}"
+        state: link
+        force: yes
+      loop:
+        - yq
+        - kustomize
+      ignore_errors: yes
+
+- name: Deploy LLM-D on Kubernetes Cluster
+  hosts: all
+  become: yes
+  gather_facts: true
+  vars:
+    llm_d_namespace: "llm-d"
+    storage_class: "local-path"
+    storage_size: "50Gi"
+    hf_token_file: "~/.cache/huggingface/token"
+    model: "Qwen/Qwen3-0.6B" # base slim
+    
+  tasks:
+    - name: Read HuggingFace token from local file
+      slurp:
+        src: "{{ hf_token_file }}"
+      register: hf_token_content
+      delegate_to: localhost
+      become: false
+      vars:
+        ansible_become: false
+
+    - name: Set HuggingFace token variable
+      set_fact:
+        hf_token: "{{ hf_token_content.content | b64decode | trim }}"
+
+    - name: Ensure llm-d-deployer directory exists
+      file:
+        path: /tmp/llm-d-deployer
+        state: directory
+        mode: '0755'
+
+    - name: Clone llm-d-deployer repository
+      git:
+        repo: https://github.com/llm-d/llm-d-deployer.git
+        dest: /tmp/llm-d-deployer
+        force: yes
+        version: main
+
+    - name: Copy base configuration to working directory
+      copy:
+        src: /tmp/llm-d-deployer/quickstart/examples/base/slim/base-slim.yaml
+        dest: /tmp/llm-d-deployer/quickstart/custom-base.yaml
+        remote_src: yes
+
+    - name: Check if llm-d namespace already exists
+      command: kubectl get namespace {{ llm_d_namespace }}
+      register: namespace_check
+      failed_when: false
+      changed_when: false
+      become: no
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+
+    - name: Display namespace status
+      debug:
+        msg: "Namespace {{ llm_d_namespace }} {{ 'exists' if namespace_check.rc == 0 else 'does not exist' }}"
+
+    - name: Set HuggingFace token environment variable
+      set_fact:
+        env_vars:
+          HF_TOKEN: "{{ hf_token }}"
+
+    - name: Make llmd-installer.sh executable
+      file:
+        path: /tmp/llm-d-deployer/quickstart/llmd-installer.sh
+        mode: '0755'
+
+    - name: Deploy llm-d with custom configuration
+      shell: |
+        export HF_TOKEN="{{ hf_token }}"
+        ./llmd-installer.sh \
+          --values-file custom-base.yaml \
+          --namespace {{ llm_d_namespace }} \
+          --storage-class {{ storage_class }} \
+          --storage-size {{ storage_size }} \
+          --download-model {{ model }}
+      args:
+        chdir: /tmp/llm-d-deployer/quickstart
+      environment:
+        HF_TOKEN: "{{ hf_token }}"
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      become: no
+      register: llm_d_install
+      async: 1800  # 30 minutes timeout
+      poll: 30
+
+    - name: Display installation output
+      debug:
+        msg: "{{ llm_d_install.stdout_lines }}"
+      when: llm_d_install.stdout_lines is defined
+
+    - name: Display installation errors (if any)
+      debug:
+        msg: "{{ llm_d_install.stderr_lines }}"
+      when: llm_d_install.stderr_lines is defined and llm_d_install.stderr_lines | length > 0
+
+    - name: Wait for llm-d pods to be ready
+      shell: |
+        echo "Waiting for llm-d pods to be ready..."
+        kubectl wait --for=condition=ready pod \
+          -n {{ llm_d_namespace }} \
+          --timeout=1800s || true
+        kubectl get pods -n {{ llm_d_namespace }} --field-selector=status.phase=Running
+      register: pod_status
+      become: no
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display pod status
+      debug:
+        msg: "{{ pod_status.stdout_lines }}"
+
+    - name: Get service information
+      command: kubectl get services -n {{ llm_d_namespace }} -o json
+      register: services
+      become: no
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      changed_when: false
+
+    - name: Display available services
+      debug:
+        msg: |
+          Available services in {{ llm_d_namespace }} namespace:
+          {{ services.stdout | from_json | json_query('items[*].{name: metadata.name, type: spec.type, nodePort: spec.ports[0].nodePort, loadBalancerIP: status.loadBalancer.ingress[0].ip}') | to_nice_yaml }}
