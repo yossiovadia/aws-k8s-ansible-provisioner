@@ -115,7 +115,7 @@
     storage_class: "local-path"
     storage_size: "50Gi"
     hf_token_file: "~/.cache/huggingface/token"
-    model: "facebook/opt-125m" # Stable working model (tested - no Triton issues)
+    model: "Qwen/Qwen3-0.6B" # base slim
     
   tasks:
     - name: Read HuggingFace token from local file
