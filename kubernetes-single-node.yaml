@@ -341,7 +341,10 @@
           -n gpu-operator --create-namespace \
           nvidia/gpu-operator \
           --set driver.enabled=true \
-          --set operator.defaultRuntime=crio
+          --set operator.defaultRuntime=crio \
+          --set toolkit.enabled=true \
+          --set cuda.enabled=true \
+          --set cuda.version=12.8
       become: no
 
 - name: Setup Local HostPath Storage

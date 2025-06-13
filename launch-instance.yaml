@@ -5,7 +5,7 @@
   gather_facts: true
   vars:
     aws_region: us-east-2
-    instance_type:  p3.2xlarge # 1 V100 GPU or g6.4xlarge 1 L4 GPU
+    instance_type:  g6.4xlarge # 1 V100 GPU or g6.4xlarge 1 L4 GPU
     ami_id: ami-00f71ac70c2d6344d  # Ubuntu 22.04 with NVIDIA GPU driver
     key_pair: router-team-us-east2
     security_group_id: sg-0704e6bcaa5e655b1  # k8s security group
