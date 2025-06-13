@@ -141,40 +141,7 @@
         state: present
       when: ansible_os_family == "Debian"
 
-    - name: Remove existing NVIDIA drivers
-      shell: |
-        apt-get remove --purge -y --allow-change-held-packages nvidia* || true
-        apt-get autoremove -y || true
-      ignore_errors: yes
-
-    - name: Add graphics-drivers PPA
-      apt_repository:
-        repo: ppa:graphics-drivers/ppa
-        state: present
-        update_cache: yes
-
-    - name: Install NVIDIA driver 535
-      apt:
-        name: nvidia-driver-535
-        state: present
-        update_cache: yes
-
-    - name: Reboot after NVIDIA driver install
-      reboot:
-        msg: "Reboot initiated by Ansible after NVIDIA driver installation"
-        pre_reboot_delay: 10
-        post_reboot_delay: 30
-        reboot_timeout: 600
-
-    - name: Wait for SSH to become available after reboot
-      wait_for:
-        host: "{{ ansible_host | default(inventory_hostname) }}"
-        port: 22
-        delay: 10
-        timeout: 300
-        state: started
-
-    - name: Verify NVIDIA driver installation
+    - name: Check NVIDIA driver installation
       command: nvidia-smi
       register: nvidia_smi_output
       ignore_errors: yes
@@ -184,16 +151,6 @@
         msg: |
           NVIDIA Driver Status:
           {{ nvidia_smi_output.stdout if nvidia_smi_output.rc == 0 else 'NVIDIA driver not found or not working properly' }}
-
-    - name: Ensure .kube directory exists for ubuntu user
-      file:
-        path: /home/ubuntu/.kube
-        state: directory
-        owner: ubuntu
-        group: ubuntu
-        mode: '0755'
-
-    # Note: admin.conf copy moved to kubernetes-single-node.yaml after kubeadm init
 
     - name: Check GPU availability
       shell: lspci | grep -i nvidia

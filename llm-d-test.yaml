@@ -4,7 +4,7 @@
   gather_facts: false
   vars:
     llm_d_namespace: "llm-d"
-    model: "facebook/opt-125m"
+    model: "Qwen/Qwen3-0.6B"
     
   tasks:
     - name: Create test id variable
@@ -29,12 +29,6 @@
       debug:
         msg: "Using gateway address: {{ gateway_address }}"
 
-    - name: Wait for all LLM-D pods to be ready
-      shell: |
-        kubectl wait --for=condition=ready pod -l llm-d.ai/inferenceServing=true -n {{ llm_d_namespace }} --timeout=600s
-      environment:
-        KUBECONFIG: /etc/kubernetes/admin.conf
-
     - name: GET /v1/models via gateway
       shell: |
         kubectl delete pod curl-gw-models-{{ test_id }} -n {{ llm_d_namespace }} || true && \
@@ -51,7 +45,7 @@
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
       retries: 3
-      delay: 10
+      delay: 5
 
     - name: Display available models from gateway
       debug:
@@ -60,9 +54,9 @@
     - name: Verify model availability via gateway
       assert:
         that:
-          - gateway_models_response.rc == 0
-        fail_msg: "Models endpoint failed - cannot proceed with inference test"
-        success_msg: "Models endpoint working correctly"
+          - model in gateway_models_response.stdout
+        fail_msg: "Model {{ model }} not available via gateway"
+        success_msg: "Model {{ model }} confirmed available via gateway"
 
     - name: POST /v1/completions via gateway
       shell: |
@@ -73,13 +67,15 @@
           curl -sS -X POST http://{{ gateway_address }}/v1/completions \
           -H 'accept: application/json' \
           -H 'Content-Type: application/json' \
-          -d '{"model":"{{ model }}","prompt":"Who are you?","max_tokens":10}' && \
-        kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/curl-gw-completion-{{ test_id }} -n {{ llm_d_namespace }} --timeout=120s && \
+          -d '{"model":"{{ model }}","prompt":"Who are you?"}' && \
+        kubectl wait --for=jsonpath='{.status.phase}'=Succeeded pod/curl-gw-completion-{{ test_id }} -n {{ llm_d_namespace }} --timeout=60s && \
         kubectl logs curl-gw-completion-{{ test_id }} -n {{ llm_d_namespace }} && \
         kubectl delete pod curl-gw-completion-{{ test_id }} -n {{ llm_d_namespace }}
       register: gateway_completion_response
       environment:
         KUBECONFIG: /etc/kubernetes/admin.conf
+      retries: 3
+      delay: 5
 
     - name: Display completion response from gateway
       debug:
