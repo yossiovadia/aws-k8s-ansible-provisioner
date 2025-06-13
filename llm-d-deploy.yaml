@@ -115,7 +115,7 @@
     storage_class: "local-path"
     storage_size: "50Gi"
     hf_token_file: "~/.cache/huggingface/token"
-    model: "facebook/opt-125m" # Stable working model (tested - no Triton issues)
+    model: "microsoft/Phi-3-mini-4k-instruct" # Updated to use Phi-3-mini model
     
   tasks:
     - name: Read HuggingFace token from local file
@@ -149,6 +149,16 @@
         src: /tmp/llm-d-deployer/quickstart/examples/base/slim/base-slim.yaml
         dest: /tmp/llm-d-deployer/quickstart/custom-base.yaml
         remote_src: yes
+
+    - name: Update model configuration in custom-base.yaml
+      shell: |
+        # Update any hardcoded model references to use our specified model
+        yq eval '.modelId = "{{ model }}"' -i /tmp/llm-d-deployer/quickstart/custom-base.yaml
+        yq eval '.model = "{{ model }}"' -i /tmp/llm-d-deployer/quickstart/custom-base.yaml
+        yq eval '.modelName = "{{ model }}"' -i /tmp/llm-d-deployer/quickstart/custom-base.yaml
+        # Also remove any hardcoded model downloads that might conflict
+        yq eval 'del(.download)' -i /tmp/llm-d-deployer/quickstart/custom-base.yaml || true
+        yq eval 'del(.downloadModel)' -i /tmp/llm-d-deployer/quickstart/custom-base.yaml || true
 
     - name: Check if llm-d namespace already exists
       command: kubectl get namespace {{ llm_d_namespace }}
